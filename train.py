@@ -156,16 +156,16 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-N_LAYER = 6
+N_LAYER = 8
 D_MODEL = 512
 N_HEAD = 8
 MLP_RATIO = 4.0
 DROPOUT = 0.0
 
 # Optimization
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 GRAD_ACCUM_STEPS = 1
-LEARNING_RATE = 6e-4
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.05
 BETA1 = 0.9
 BETA2 = 0.95
@@ -174,8 +174,8 @@ MIN_LR_FRAC = 0.10
 MAX_GRAD_NORM = 1.0
 
 # Runtime
-EVAL_BATCH_SIZE = 64
-COMPILE_MODEL = False
+EVAL_BATCH_SIZE = 128
+COMPILE_MODEL = True
 WARMUP_STEPS = 5
 
 # Artifacts
