@@ -260,6 +260,12 @@ def _build_notebook_code(dataset_slug: str, bundle_metrics: dict) -> str:
             return " ".join(text.split())
 
 
+        def _normalize_prediction_text(value) -> str:
+            text = _normalize_text(value)
+            # Kaggle submissions must not contain null/blank prediction cells.
+            return text if text else "[blank]"
+
+
         class Tokenizer:
             def __init__(self, tokenizer_path: Path):
                 with open(tokenizer_path, "rb") as f:
@@ -466,21 +472,47 @@ def _build_notebook_code(dataset_slug: str, bundle_metrics: dict) -> str:
             test_df = pd.read_csv(TEST_PATH)
             sample_df = pd.read_csv(SAMPLE_PATH)
             schema = _detect_schema(test_df, sample_df)
+            id_col = schema["id_col"]
 
             rows = []
-            for _, row in test_df.iterrows():
-                source = _normalize_text(row[schema["source_col"]])
-                if not source:
-                    continue
-                item_id = _normalize_text(row[schema["id_col"]]) if schema["id_col"] and schema["id_col"] in row else ""
-                prompt_ids = _encode_prompt(tokenizer, source)
-                rows.append(
-                    {{
-                        "id": item_id,
-                        "prompt_ids": prompt_ids,
-                        "prompt_len": len(prompt_ids),
-                    }}
-                )
+            if id_col and id_col in test_df.columns and id_col in sample_df.columns:
+                if test_df[id_col].duplicated().any():
+                    raise ValueError(f"test.csv contains duplicate ids in column '{{id_col}}'")
+                test_by_id = test_df.set_index(id_col, drop=False)
+                missing_ids = sample_df.loc[~sample_df[id_col].isin(test_by_id.index), id_col].tolist()
+                if missing_ids:
+                    preview = missing_ids[:5]
+                    raise ValueError(
+                        f"sample_submission.csv contains ids not present in test.csv: {{preview}}"
+                    )
+
+                for _, submission_row in sample_df.iterrows():
+                    test_row = test_by_id.loc[submission_row[id_col]]
+                    source = _normalize_text(test_row[schema["source_col"]])
+                    prompt_ids = _encode_prompt(tokenizer, source)
+                    rows.append(
+                        {{
+                            "id": _normalize_text(submission_row[id_col]),
+                            "prompt_ids": prompt_ids,
+                            "prompt_len": len(prompt_ids),
+                        }}
+                    )
+            else:
+                if len(test_df) != len(sample_df):
+                    raise ValueError(
+                        f"test.csv rows {{len(test_df)}} do not match sample rows {{len(sample_df)}}"
+                    )
+                for row_idx in range(len(sample_df)):
+                    row = test_df.iloc[row_idx]
+                    source = _normalize_text(row[schema["source_col"]])
+                    prompt_ids = _encode_prompt(tokenizer, source)
+                    rows.append(
+                        {{
+                            "id": str(row_idx),
+                            "prompt_ids": prompt_ids,
+                            "prompt_len": len(prompt_ids),
+                        }}
+                    )
 
             return rows, sample_df, schema["submission_col"]
 
@@ -501,6 +533,7 @@ def _build_notebook_code(dataset_slug: str, bundle_metrics: dict) -> str:
 
         test_rows, submission, submission_col = load_test_rows(tokenizer)
         predictions = generate_predictions(model, tokenizer, test_rows)
+        predictions = [_normalize_prediction_text(prediction) for prediction in predictions]
 
         if len(predictions) != len(submission):
             raise ValueError(
@@ -508,8 +541,18 @@ def _build_notebook_code(dataset_slug: str, bundle_metrics: dict) -> str:
             )
 
         submission[submission_col] = predictions
+        if submission[submission_col].isna().any():
+            raise ValueError("Submission contains null prediction values.")
+        if (submission[submission_col].astype(str).str.strip() == "").any():
+            raise ValueError("Submission contains blank prediction values.")
+        if list(submission.columns) != list(pd.read_csv(SAMPLE_PATH, nrows=0).columns):
+            raise ValueError(
+                f"Submission columns {{list(submission.columns)}} do not match sample columns "
+                f"{{list(pd.read_csv(SAMPLE_PATH, nrows=0).columns)}}"
+            )
         submission.to_csv(OUTPUT_PATH, index=False)
         print(f"Wrote {{OUTPUT_PATH}}")
+        print(f"Submission rows: {{len(submission)}} | columns: {{list(submission.columns)}}")
         print(submission.head())
         """
     ).strip() + "\n"

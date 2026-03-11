@@ -21,6 +21,7 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import sys
 import zipfile
@@ -45,6 +46,7 @@ VAL_FRACTION = 0.10
 VAL_MIN_EXAMPLES = 128
 VAL_MAX_EXAMPLES = 512
 VOCAB_SIZE = 4096
+PREP_VERSION = "seq2seq-mbr-v1"
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -57,6 +59,7 @@ TRAIN_PATH = PROCESSED_DIR / "train.pkl"
 VAL_PATH = PROCESSED_DIR / "val.pkl"
 TEST_PATH = PROCESSED_DIR / "test.pkl"
 METADATA_PATH = PROCESSED_DIR / "metadata.json"
+TOKENIZER_META_PATH = TOKENIZER_DIR / "meta.json"
 
 SPECIAL_TOKENS = [
     "<|bos|>",
@@ -94,6 +97,204 @@ ID_COLUMN_CANDIDATES = ["id", "ID", "row_id"]
 
 _SPLIT_CACHE = {}
 _METADATA_CACHE = None
+
+# ---------------------------------------------------------------------------
+# Akkadian-specific normalization helpers
+# ---------------------------------------------------------------------------
+
+_V2 = re.compile(r"([aAeEiIuU])(?:2|₂)")
+_V3 = re.compile(r"([aAeEiIuU])(?:3|₃)")
+_ACUTE = str.maketrans({"a": "á", "e": "é", "i": "í", "u": "ú", "A": "Á", "E": "É", "I": "Í", "U": "Ú"})
+_GRAVE = str.maketrans({"a": "à", "e": "è", "i": "ì", "u": "ù", "A": "À", "E": "È", "I": "Ì", "U": "Ù"})
+
+_ALLOWED_FRACS = [
+    (1 / 6, "0.16666"),
+    (1 / 4, "0.25"),
+    (1 / 3, "0.33333"),
+    (1 / 2, "0.5"),
+    (2 / 3, "0.66666"),
+    (3 / 4, "0.75"),
+    (5 / 6, "0.83333"),
+]
+_FRAC_TOL = 2e-3
+_FLOAT_RE = re.compile(r"(?<![\w/])(\d+\.\d{4,})(?![\w/])")
+_WS_RE = re.compile(r"\s+")
+
+_GAP_UNIFIED_RE = re.compile(
+    r"<\s*big[\s_\-]*gap\s*>"
+    r"|<\s*gap\s*>"
+    r"|\bbig[\s_\-]*gap\b"
+    r"|\bx(?:\s+x)+\b"
+    r"|\.{3,}|…+|\[\.+\]"
+    r"|\[\s*x\s*\]|\(\s*x\s*\)"
+    r"|(?<!\w)x{2,}(?!\w)"
+    r"|(?<!\w)x(?!\w)"
+    r"|\(\s*large\s+break\s*\)"
+    r"|\(\s*break\s*\)"
+    r"|\(\s*\d+\s+broken\s+lines?\s*\)",
+    re.I,
+)
+
+_CHAR_TRANS = str.maketrans(
+    {
+        "ḫ": "h",
+        "Ḫ": "H",
+        "ʾ": "",
+        "₀": "0",
+        "₁": "1",
+        "₂": "2",
+        "₃": "3",
+        "₄": "4",
+        "₅": "5",
+        "₆": "6",
+        "₇": "7",
+        "₈": "8",
+        "₉": "9",
+        "—": "-",
+        "–": "-",
+    }
+)
+_SUB_X = "ₓ"
+_UNICODE_UPPER = r"A-ZŠṬṢḪ\u00C0-\u00D6\u00D8-\u00DE\u0160\u1E00-\u1EFF"
+_UNICODE_LOWER = r"a-zšṭṣḫ\u00E0-\u00F6\u00F8-\u00FF\u0161\u1E01-\u1EFF"
+_DET_UPPER_RE = re.compile(r"\(([" + _UNICODE_UPPER + r"0-9]{1,6})\)")
+_DET_LOWER_RE = re.compile(r"\(([" + _UNICODE_LOWER + r"]{1,4})\)")
+_KUBABBAR_RE = re.compile(r"KÙ\.B\.")
+_EXACT_FRAC_RE = re.compile(r"0\.8333|0\.6666|0\.3333|0\.1666|0\.625|0\.75|0\.25|0\.5")
+_EXACT_FRAC_MAP = {
+    "0.8333": "⅚",
+    "0.6666": "⅔",
+    "0.3333": "⅓",
+    "0.1666": "⅙",
+    "0.625": "⅝",
+    "0.75": "¾",
+    "0.25": "¼",
+    "0.5": "½",
+}
+
+_PN_RE = re.compile(r"\bPN\b")
+_SOFT_GRAM_RE = re.compile(
+    r"\(\s*(?:fem|plur|pl|sing|singular|plural|\?|\!)"
+    r"(?:\.\s*(?:plur|plural|sing|singular))?"
+    r"\.?\s*[^)]*\)",
+    re.I,
+)
+_BARE_GRAM_RE = re.compile(r"(?<!\w)(?:fem|sing|pl|plural)\.?(?!\w)\s*", re.I)
+_UNCERTAIN_RE = re.compile(r"\(\?\)")
+_CURLY_DQ_RE = re.compile("[\u201c\u201d]")
+_CURLY_SQ_RE = re.compile("[\u2018\u2019]")
+_MONTH_RE = re.compile(r"\bMonth\s+(XII|XI|X|IX|VIII|VII|VI|V|IV|III|II|I)\b", re.I)
+_ROMAN2INT = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10, "XI": 11, "XII": 12}
+_REPEAT_WORD_RE = re.compile(r"\b(\w+)(?:\s+\1\b)+")
+_REPEAT_PUNCT_RE = re.compile(r"([.,])\1+")
+_PUNCT_SPACE_RE = re.compile(r"\s+([.,:])")
+_FORBIDDEN_TRANS = str.maketrans("", "", '——<>⌈⌋⌊[]+ʾ;')
+_COMMODITY_RE = re.compile(r"(?<=\s)-(gold|tax|textiles)\b")
+_COMMODITY_REPL = {"gold": "pašallum gold", "tax": "šadduātum tax", "textiles": "kutānum textiles"}
+_SHEKEL_REPLS = [
+    (re.compile(r"5\s+11\s*/\s*12\s+shekels?", re.I), "6 shekels less 15 grains"),
+    (re.compile(r"5\s*/\s*12\s+shekels?", re.I), "⅓ shekel 15 grains"),
+    (re.compile(r"7\s*/\s*12\s+shekels?", re.I), "½ shekel 15 grains"),
+    (re.compile(r"1\s*/\s*12\s*(?:\(shekel\)|\bshekel)?", re.I), "15 grains"),
+]
+_SLASH_ALT_RE = re.compile(r"(?<![0-9/])\s+/\s+(?![0-9])\S+")
+_STRAY_MARKS_RE = re.compile(r"<<[^>]*>>|<(?!gap\b)[^>]*>")
+_MULTI_GAP_RE = re.compile(r"(?:<gap>\s*){2,}")
+_EXTRA_STRAY_RE = re.compile(r"(?<!\w)(?:\.\.+|xx+)(?!\w)")
+_HACEK_TRANS = str.maketrans({"ḫ": "h", "Ḫ": "H"})
+
+
+def _read_json_if_exists(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _ascii_to_diacritics(text: str) -> str:
+    text = text.replace("sz", "š").replace("SZ", "Š")
+    text = text.replace("s,", "ṣ").replace("S,", "Ṣ")
+    text = text.replace("t,", "ṭ").replace("T,", "Ṭ")
+    text = _V2.sub(lambda match: match.group(1).translate(_ACUTE), text)
+    text = _V3.sub(lambda match: match.group(1).translate(_GRAVE), text)
+    return text
+
+
+def _canon_decimal(value: float) -> str:
+    integer_part = int(math.floor(value + 1e-12))
+    fraction = value - integer_part
+    best = min(_ALLOWED_FRACS, key=lambda pair: abs(fraction - pair[0]))
+    if abs(fraction - best[0]) <= _FRAC_TOL:
+        decimal = best[1]
+        if integer_part == 0:
+            return decimal
+        return f"{integer_part}{decimal[1:]}" if decimal.startswith("0.") else f"{integer_part}+{decimal}"
+    return f"{value:.5f}".rstrip("0").rstrip(".")
+
+
+def _frac_repl(match: re.Match) -> str:
+    return _EXACT_FRAC_MAP[match.group(0)]
+
+
+def _commodity_repl(match: re.Match) -> str:
+    return _COMMODITY_REPL[match.group(1)]
+
+
+def _month_repl(match: re.Match) -> str:
+    return f"Month {_ROMAN2INT.get(match.group(1).upper(), match.group(1))}"
+
+
+def _normalize_gaps(text: str) -> str:
+    return _GAP_UNIFIED_RE.sub("<gap>", text)
+
+
+def _normalize_source_text(value) -> str:
+    text = _normalize_text(value)
+    if not text:
+        return ""
+    text = _ascii_to_diacritics(text)
+    text = _DET_UPPER_RE.sub(r"\1", text)
+    text = _DET_LOWER_RE.sub(r"{\1}", text)
+    text = _normalize_gaps(text)
+    text = text.translate(_CHAR_TRANS).replace(_SUB_X, "")
+    text = _KUBABBAR_RE.sub("KÙ.BABBAR", text)
+    text = _EXACT_FRAC_RE.sub(_frac_repl, text)
+    text = _FLOAT_RE.sub(lambda match: _canon_decimal(float(match.group(1))), text)
+    return _WS_RE.sub(" ", text).strip()
+
+
+def postprocess_translation_text(value) -> str:
+    text = _normalize_text(value)
+    if not text:
+        return ""
+    text = _normalize_gaps(text)
+    text = _PN_RE.sub("<gap>", text)
+    text = _COMMODITY_RE.sub(_commodity_repl, text)
+    for pattern, repl in _SHEKEL_REPLS:
+        text = pattern.sub(repl, text)
+    text = _EXACT_FRAC_RE.sub(_frac_repl, text)
+    text = _FLOAT_RE.sub(lambda match: _canon_decimal(float(match.group(1))), text)
+    text = _SOFT_GRAM_RE.sub(" ", text)
+    text = _BARE_GRAM_RE.sub(" ", text)
+    text = _UNCERTAIN_RE.sub("", text)
+    text = _STRAY_MARKS_RE.sub("", text)
+    text = _EXTRA_STRAY_RE.sub("", text)
+    text = _SLASH_ALT_RE.sub("", text)
+    text = _CURLY_DQ_RE.sub('"', text)
+    text = _CURLY_SQ_RE.sub("'", text)
+    text = _MONTH_RE.sub(_month_repl, text)
+    text = _MULTI_GAP_RE.sub("<gap>", text)
+    text = text.replace("<gap>", "\x00GAP\x00")
+    text = text.translate(_FORBIDDEN_TRANS)
+    text = text.replace("\x00GAP\x00", " <gap> ")
+    text = text.translate(_HACEK_TRANS)
+    text = _REPEAT_WORD_RE.sub(r"\1", text)
+    for n in range(4, 1, -1):
+        pattern = re.compile(r"\b((?:\w+\s+){" + str(n - 1) + r"}\w+)(?:\s+\1\b)+")
+        text = pattern.sub(r"\1", text)
+    text = _PUNCT_SPACE_RE.sub(r"\1", text)
+    text = _REPEAT_PUNCT_RE.sub(r"\1", text)
+    return _WS_RE.sub(" ", text).strip()
 
 # ---------------------------------------------------------------------------
 # Kaggle download
@@ -338,7 +539,7 @@ def build_fixed_split():
 
     rows = []
     for _, row in train_df.iterrows():
-        source = _normalize_text(row[source_col])
+        source = _normalize_source_text(row[source_col])
         target = _normalize_text(row[target_col])
         if not source or not target:
             continue
@@ -364,7 +565,7 @@ def build_fixed_split():
 
     test_rows = []
     for _, row in test_df.iterrows():
-        source = _normalize_text(row[schema["test_source_col"]])
+        source = _normalize_source_text(row[schema["test_source_col"]])
         if not source:
             continue
         test_rows.append(
@@ -385,6 +586,7 @@ def build_fixed_split():
         "max_seq_len": MAX_SEQ_LEN,
         "max_prompt_tokens": MAX_PROMPT_TOKENS,
         "max_target_tokens": MAX_TARGET_TOKENS,
+        "prep_version": PREP_VERSION,
     }
     return train_rows, val_rows, test_rows, metadata
 
@@ -402,9 +604,17 @@ def _train_text_iterator(train_rows):
 
 def train_tokenizer(train_rows):
     tokenizer_pkl = TOKENIZER_DIR / "tokenizer.pkl"
-    if tokenizer_pkl.exists():
+    expected_meta = {
+        "prep_version": PREP_VERSION,
+        "vocab_size": VOCAB_SIZE,
+        "special_tokens": SPECIAL_TOKENS,
+    }
+    if tokenizer_pkl.exists() and _read_json_if_exists(TOKENIZER_META_PATH) == expected_meta:
         print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
         return
+
+    if TOKENIZER_DIR.exists():
+        shutil.rmtree(TOKENIZER_DIR)
 
     TOKENIZER_DIR.mkdir(parents=True, exist_ok=True)
     print("Tokenizer: training shared BPE tokenizer on train split")
@@ -425,6 +635,8 @@ def train_tokenizer(train_rows):
 
     with open(tokenizer_pkl, "wb") as f:
         pickle.dump(enc, f)
+    with open(TOKENIZER_META_PATH, "w") as f:
+        json.dump(expected_meta, f, indent=2, sort_keys=True)
     print(f"Tokenizer: saved to {tokenizer_pkl}")
 
 
@@ -465,10 +677,12 @@ def _truncate(ids: list[int], max_len: int) -> list[int]:
 def _encode_example(tokenizer: Tokenizer, source: str, target: str | None):
     source_ids = _truncate(tokenizer.encode_text(source), MAX_PROMPT_TOKENS - 3)
     prompt_ids = [tokenizer.bos_token_id, tokenizer.source_token_id] + source_ids + [tokenizer.target_token_id]
+    encoder_ids = [tokenizer.bos_token_id, tokenizer.source_token_id] + source_ids + [tokenizer.eos_token_id]
 
     if target is None:
         return {
             "prompt_ids": prompt_ids,
+            "source_ids": encoder_ids,
             "source": source,
         }
 
@@ -483,6 +697,9 @@ def _encode_example(tokenizer: Tokenizer, source: str, target: str | None):
         "prompt_ids": prompt_ids,
         "full_ids": full_ids,
         "loss_mask_start": len(prompt_ids) - 1,
+        "source_ids": encoder_ids,
+        "decoder_input_ids": [tokenizer.target_token_id] + target_ids,
+        "labels": target_ids + [tokenizer.eos_token_id],
         "source": source,
         "target": target,
     }
@@ -553,25 +770,28 @@ def make_dataloader(batch_size: int, split: str, device: str = "cuda", seed: int
         for start in range(0, len(indices), batch_size):
             batch = [examples[i] for i in indices[start:start + batch_size]]
             batch_size_now = len(batch)
-            max_len = max(len(example["full_ids"]) - 1 for example in batch)
+            max_src_len = max(len(example["source_ids"]) for example in batch)
+            max_tgt_len = max(len(example["decoder_input_ids"]) for example in batch)
 
-            x = torch.full((batch_size_now, max_len), pad_id, dtype=torch.long)
-            y = torch.full((batch_size_now, max_len), -100, dtype=torch.long)
+            source_ids = torch.full((batch_size_now, max_src_len), pad_id, dtype=torch.long)
+            source_mask = torch.zeros((batch_size_now, max_src_len), dtype=torch.bool)
+            decoder_input_ids = torch.full((batch_size_now, max_tgt_len), pad_id, dtype=torch.long)
+            labels = torch.full((batch_size_now, max_tgt_len), -100, dtype=torch.long)
 
             for row_idx, example in enumerate(batch):
-                full_ids = example["full_ids"]
-                seq_len = len(full_ids) - 1
-                x[row_idx, :seq_len] = torch.tensor(full_ids[:-1], dtype=torch.long)
-                targets = torch.tensor(full_ids[1:], dtype=torch.long)
-                mask_start = min(example["loss_mask_start"], seq_len)
-                if mask_start > 0:
-                    targets[:mask_start] = -100
-                y[row_idx, :seq_len] = targets
+                src_len = len(example["source_ids"])
+                tgt_len = len(example["decoder_input_ids"])
+                source_ids[row_idx, :src_len] = torch.tensor(example["source_ids"], dtype=torch.long)
+                source_mask[row_idx, :src_len] = True
+                decoder_input_ids[row_idx, :tgt_len] = torch.tensor(example["decoder_input_ids"], dtype=torch.long)
+                labels[row_idx, :tgt_len] = torch.tensor(example["labels"], dtype=torch.long)
 
             if device:
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-            yield x, y, epoch + 1
+                source_ids = source_ids.to(device, non_blocking=True)
+                source_mask = source_mask.to(device, non_blocking=True)
+                decoder_input_ids = decoder_input_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+            yield source_ids, source_mask, decoder_input_ids, labels, epoch + 1
 
         epoch += 1
         if split == "val":
@@ -599,6 +819,26 @@ def evaluate_translation(model, tokenizer: Tokenizer, batch_size: int, max_new_t
 
     for start in range(0, len(val_examples), batch_size):
         batch = val_examples[start:start + batch_size]
+
+        if hasattr(model, "generate_translations"):
+            max_src_len = max(len(example["source_ids"]) for example in batch)
+            source_ids = torch.full((len(batch), max_src_len), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            source_mask = torch.zeros((len(batch), max_src_len), dtype=torch.bool, device=device)
+            for row_idx, example in enumerate(batch):
+                src = torch.tensor(example["source_ids"], dtype=torch.long, device=device)
+                source_ids[row_idx, :src.numel()] = src
+                source_mask[row_idx, :src.numel()] = True
+            batch_predictions = model.generate_translations(
+                source_ids=source_ids,
+                source_mask=source_mask,
+                tokenizer=tokenizer,
+                max_new_tokens=max_new_tokens,
+            )
+            for prediction, example in zip(batch_predictions, batch):
+                predictions.append(postprocess_translation_text(prediction))
+                references.append(example["target"])
+            continue
+
         prompt_lens = [len(example["prompt_ids"]) for example in batch]
         max_prompt_len = max(prompt_lens)
         input_ids = torch.full((len(batch), max_prompt_len), tokenizer.pad_token_id, dtype=torch.long, device=device)
@@ -632,7 +872,7 @@ def evaluate_translation(model, tokenizer: Tokenizer, batch_size: int, max_new_t
 
         for row_idx, example in enumerate(batch):
             prediction = _decode_generated(tokenizer, input_ids[row_idx, :lengths[row_idx]], prompt_lens[row_idx])
-            predictions.append(prediction)
+            predictions.append(postprocess_translation_text(prediction))
             references.append(example["target"])
 
     bleu = bleu_metric.corpus_score(predictions, [references]).score
@@ -644,6 +884,55 @@ def evaluate_translation(model, tokenizer: Tokenizer, batch_size: int, max_new_t
         "chrf": chrf,
         "num_examples": len(references),
     }
+
+
+def _write_metadata(metadata: dict) -> None:
+    metadata["vocab_size"] = Tokenizer.from_directory().get_vocab_size()
+    metadata["prep_version"] = PREP_VERSION
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    with open(METADATA_PATH, "w") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
+
+def prepare_runtime(force_download: bool = False) -> dict:
+    download_competition_data(force=force_download)
+    train_rows, val_rows, test_rows, metadata = build_fixed_split()
+    train_tokenizer(train_rows)
+    encode_datasets(train_rows, val_rows, test_rows)
+    _write_metadata(metadata)
+    return {
+        "train_rows": train_rows,
+        "val_rows": val_rows,
+        "test_rows": test_rows,
+        "metadata": metadata,
+    }
+
+
+def ensure_prepared_data() -> None:
+    required_paths = [
+        RAW_DIR / "train.csv",
+        RAW_DIR / "test.csv",
+        RAW_DIR / "sample_submission.csv",
+        TOKENIZER_DIR / "tokenizer.pkl",
+        TOKENIZER_META_PATH,
+        TRAIN_PATH,
+        VAL_PATH,
+        TEST_PATH,
+        METADATA_PATH,
+    ]
+    metadata = _read_json_if_exists(METADATA_PATH)
+    tokenizer_meta = _read_json_if_exists(TOKENIZER_META_PATH)
+    needs_refresh = any(not path.exists() for path in required_paths)
+    needs_refresh = needs_refresh or metadata.get("prep_version") != PREP_VERSION
+    needs_refresh = needs_refresh or tokenizer_meta.get("prep_version") != PREP_VERSION
+    if not needs_refresh:
+        return
+
+    print("prepare.py: refreshing cached tokenizer/data for current preprocessing version")
+    _SPLIT_CACHE.clear()
+    global _METADATA_CACHE
+    _METADATA_CACHE = None
+    prepare_runtime(force_download=False)
 
 
 # ---------------------------------------------------------------------------
@@ -659,24 +948,17 @@ def main():
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    download_competition_data(force=args.force_download)
+    prepared = prepare_runtime(force_download=args.force_download)
+    train_rows = prepared["train_rows"]
+    val_rows = prepared["val_rows"]
+    test_rows = prepared["test_rows"]
+    metadata = prepared["metadata"]
     print()
 
-    train_rows, val_rows, test_rows, metadata = build_fixed_split()
     print(f"Train examples: {len(train_rows)}")
     print(f"Val examples:   {len(val_rows)}")
     print(f"Test examples:  {len(test_rows)}")
     print(f"Schema: source={metadata['schema']['source_col']}, target={metadata['schema']['target_col']}")
-    print()
-
-    train_tokenizer(train_rows)
-    print()
-
-    encode_datasets(train_rows, val_rows, test_rows)
-    metadata["vocab_size"] = Tokenizer.from_directory().get_vocab_size()
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    with open(METADATA_PATH, "w") as f:
-        json.dump(metadata, f, indent=2, sort_keys=True)
     print()
     print(f"Saved metadata to {METADATA_PATH}")
     print("Done! Ready to train.")
